@@ -968,6 +968,189 @@ def main():
     
     teacher_model.eval()
     best_eval = 0 if args.save_best else None
+    
+    # logs
+    
+    interval = 2
+    findEpoch = 15
+    mapping_results = [(i+1) * args.teacher_filter_interval - 1 for i in range(teacher_config.num_hidden_layers // args.teacher_filter_interval)]
+    loss_list = []
+    
+    
+    for epoch in range(findEpoch):
+        model.train()
+        loss_results = [0 for i in mapping_results]
+
+        if args.with_tracking:
+            total_loss = 0
+        for step, batch in enumerate(train_dataloader):
+            # We need to skip steps until we reach the resumed step
+            if args.resume_from_checkpoint and epoch == starting_epoch:
+                if resume_step is not None and step < resume_step:
+                    completed_steps += 1
+                    continue
+
+            with accelerator.accumulate(model):
+                outputs = model(**batch)
+                with torch.no_grad():
+                    batch = batch.to(next(teacher_model.parameters()).device)
+                    teacher_outputs = teacher_model(**batch, output_hidden_states=(args.mse_alpha > 0 and args.filter_disabled)) # output_hidden_states is set to True in lwd.
+                
+                kl_loss = 0.0
+                if args.kl_alpha > 0:
+
+                    def kl_div(input, target, T = 2.0):
+                        input_log_softmax = F.log_softmax(input / T, dim=-1)
+                        target_softmax = F.softmax(target / T, dim=-1)
+                        return F.kl_div(
+                            input_log_softmax, target_softmax, reduction="batchmean"
+                        ) * T ** 2 # divided by the batchsize to conform with KL math definition
+
+                    start_kl_loss = kl_div(
+                        outputs.start_logits, teacher_outputs.start_logits.detach())
+                    end_kl_loss = kl_div(
+                        outputs.end_logits, teacher_outputs.end_logits.detach())
+                    kl_loss = (start_kl_loss + end_kl_loss) / 2.0
+                
+                mse_loss = 0.0
+                if args.mse_alpha > 0:
+                    if not args.filter_disabled:
+                        teacher_states = teacher_outputs.filter_states
+                    else:
+                        # TODO: Find optimal mapping funciton instead of interval
+                        teacher_states = teacher_outputs.hidden_states[1:]
+                        teacher_states = [teacher_states[i] for i in mapping_results]
+                    for state, teacher_state in zip(outputs.filter_states, teacher_states):
+                        loss_results.append(F.mse_loss(
+                            state, teacher_state.detach(), reduction="mean"))
+                        
+                        mse_loss += F.mse_loss(
+                            state, teacher_state.detach(), reduction="mean"
+                        ) # torch.mean((state - teacher_state)**2)
+                    mse_loss = mse_loss / len(outputs.filter_states)
+                loss_list = [loss_results[i] + loss_list[i] for i in range(len(loss_results))]
+                
+                loss = outputs.loss + args.kl_alpha * kl_loss + args.mse_alpha * mse_loss
+
+                # We keep track of the loss at each epoch
+                if args.with_tracking:
+                    total_loss += loss.detach().float()
+
+                accelerator.backward(loss)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                completed_steps += 1
+
+            if isinstance(checkpointing_steps, int):
+                if completed_steps % checkpointing_steps == 0:
+                    output_dir = f"step_{completed_steps }"
+                    if args.output_dir is not None:
+                        output_dir = os.path.join(args.output_dir, output_dir)
+                    accelerator.save_state(output_dir)
+
+            if completed_steps >= args.max_train_steps:
+                break
+
+        
+        # mapping function tunning
+        if epoch % interval == 0:
+            # tune
+            maxIndex = loss_results.index(max(loss_results))
+            minIndex = loss_results.index(min(loss_results))
+            if maxIndex == len(mapping_results) -1:
+                pass
+            elif maxIndex == 0 and mapping_results[maxIndex] > 0:
+                mapping_results[maxIndex] = mapping_results[maxIndex] - 1
+            elif mapping_results[maxIndex] -1 > mapping_results[maxIndex -1]:
+                mapping_results[maxIndex] = mapping_results[maxIndex] -1
+                
+            if minIndex == 0:
+                pass
+            elif minIndex == len(mapping_results) - 1 and mapping_results[minIndex] < teacher_config.num_hidden_layers - 1:
+                mapping_results[minIndex] = mapping_results[minIndex] + 1
+            elif mapping_results[minIndex] + 1 < mapping_results[minIndex + 1]:
+                mapping_results[minIndex] = mapping_results[minIndex] + 1
+            
+            pass
+        
+        if args.checkpointing_steps == "epoch":
+            output_dir = f"epoch_{epoch}"
+            if args.output_dir is not None:
+                output_dir = os.path.join(args.output_dir, output_dir)
+            accelerator.save_state(output_dir)
+
+        if args.push_to_hub and epoch < args.num_train_epochs - 1:
+            accelerator.wait_for_everyone()
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(
+                args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+            )
+            if accelerator.is_main_process:
+                tokenizer.save_pretrained(args.output_dir)
+                repo.push_to_hub(
+                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
+                )
+
+        # Evaluation
+        logger.info("***** Running Evaluation *****")
+        logger.info(f"  Num examples = {len(eval_dataset)}")
+        logger.info(f"  Batch size = {args.per_device_eval_batch_size}")
+
+        all_start_logits = []
+        all_end_logits = []
+
+        model.eval()
+        for step, batch in enumerate(eval_dataloader):
+            with torch.no_grad():
+                outputs = model(**batch)
+                start_logits = outputs.start_logits
+                end_logits = outputs.end_logits
+
+                if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
+                    start_logits = accelerator.pad_across_processes(start_logits, dim=1, pad_index=-100)
+                    end_logits = accelerator.pad_across_processes(end_logits, dim=1, pad_index=-100)
+
+                all_start_logits.append(accelerator.gather_for_metrics(start_logits).cpu().numpy())
+                all_end_logits.append(accelerator.gather_for_metrics(end_logits).cpu().numpy())
+
+        max_len = max([x.shape[1] for x in all_start_logits])  # Get the max_length of the tensor
+
+        # concatenate the numpy array
+        start_logits_concat = create_and_fill_np_array(all_start_logits, eval_dataset, max_len)
+        end_logits_concat = create_and_fill_np_array(all_end_logits, eval_dataset, max_len)
+
+        # delete the list of numpy arrays
+        del all_start_logits
+        del all_end_logits
+
+        outputs_numpy = (start_logits_concat, end_logits_concat)
+        prediction = post_processing_function(eval_examples, eval_dataset, outputs_numpy)
+        eval_metric = metric.compute(predictions=prediction.predictions, references=prediction.label_ids)
+        logger.info(f"Evaluation metrics: {eval_metric}")
+        
+        if args.save_best:
+            if eval_metric['f1'] > best_eval:
+                best_eval = eval_metric['f1']
+                if args.output_dir is not None:
+                    accelerator.wait_for_everyone()
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    unwrapped_model.save_pretrained(
+                        args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+                    )
+                    if accelerator.is_main_process:
+                        tokenizer.save_pretrained(args.output_dir)
+                        if args.push_to_hub:
+                            repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
+
+                        logger.info(json.dumps(eval_metric, indent=4))
+                        save_prefixed_metrics(eval_metric, args.output_dir)
+
+    
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
 

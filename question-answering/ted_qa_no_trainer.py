@@ -341,6 +341,7 @@ def parse_args():
         default=1,
         help="the layer interval between two consecutive student filters.",
     )
+    # TODO
     parser.add_argument(
         "--teacher_filter_interval",
         type=int,
@@ -1006,6 +1007,7 @@ def main():
                     if not args.filter_disabled:
                         teacher_states = teacher_outputs.filter_states
                     else:
+                        # TODO: Find optimal mapping funciton instead of interval
                         teacher_states = teacher_outputs.hidden_states[1:]
                         teacher_states = [teacher_states[(i+1) * args.teacher_filter_interval - 1] for i in range(teacher_config.num_hidden_layers // args.teacher_filter_interval)]
                     for state, teacher_state in zip(outputs.filter_states, teacher_states):
